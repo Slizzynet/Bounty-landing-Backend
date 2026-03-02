@@ -5,10 +5,13 @@ const sqlite3 = require("sqlite3").verbose();
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 const cors = require("cors");
-const axios = require("axios");
+const helmet = require("helmet");
 
 const app = express();
-app.use(cors());
+app.use(helmet());
+app.use(cors({
+  origin: "*"
+}));
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
@@ -20,7 +23,7 @@ const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
 const db = new sqlite3.Database("./database.db");
 
 
-// ================= DATABASE SETUP =================
+// ================= DATABASE =================
 
 db.serialize(async () => {
 
@@ -29,6 +32,8 @@ db.serialize(async () => {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       username TEXT UNIQUE,
       password TEXT,
+      claimsCount INTEGER DEFAULT 0,
+      rank TEXT DEFAULT 'Unranked',
       isAdmin INTEGER DEFAULT 0
     )
   `);
@@ -39,7 +44,8 @@ db.serialize(async () => {
       target TEXT,
       reason TEXT,
       amount REAL,
-      createdBy INTEGER
+      createdBy INTEGER,
+      createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
     )
   `);
 
@@ -47,78 +53,56 @@ db.serialize(async () => {
     CREATE TABLE IF NOT EXISTS claims (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       missionId INTEGER,
+      userId INTEGER,
       clip TEXT,
       paypal TEXT,
       status TEXT DEFAULT 'pending'
     )
   `);
 
-  // CREATE ADMIN ACCOUNT IF NOT EXISTS
-  db.get(
-    "SELECT * FROM users WHERE username = ?",
-    [ADMIN_USERNAME],
-    async (err, user) => {
-
-      if (!user) {
-
-        const hashed = await bcrypt.hash(ADMIN_PASSWORD, 10);
-
-        db.run(
-          "INSERT INTO users (username, password, isAdmin) VALUES (?, ?, 1)",
-          [ADMIN_USERNAME, hashed],
-          () => {
-            console.log("Admin account created");
-          }
-        );
-
-      }
-
+  // Create admin if missing
+  db.get("SELECT * FROM users WHERE username = ?", [ADMIN_USERNAME], async (err, user) => {
+    if (!user) {
+      const hashed = await bcrypt.hash(ADMIN_PASSWORD, 10);
+      db.run(
+        "INSERT INTO users (username, password, isAdmin) VALUES (?, ?, 1)",
+        [ADMIN_USERNAME, hashed]
+      );
+      console.log("Admin account created");
     }
-  );
+  });
 
 });
 
 
-// ================= AUTH MIDDLEWARE =================
+// ================= AUTH =================
 
 function authenticateToken(req, res, next) {
 
   const authHeader = req.headers["authorization"];
-
-  if (!authHeader)
-    return res.status(401).json({ error: "Token required" });
+  if (!authHeader) return res.status(401).json({ error: "Token required" });
 
   const token = authHeader.split(" ")[1];
 
   jwt.verify(token, JWT_SECRET, (err, user) => {
-
-    if (err)
-      return res.status(403).json({ error: "Invalid token" });
-
+    if (err) return res.status(403).json({ error: "Invalid token" });
     req.user = user;
-
     next();
-
   });
 
 }
 
-
 function requireAdmin(req, res, next) {
-
   if (!req.user.isAdmin)
     return res.status(403).json({ error: "Admin only" });
-
   next();
-
 }
 
 
 // ================= ROUTES =================
 
-// Health check
 app.get("/", (req, res) => {
-  res.send("Production backend running ✅");
+  res.send("Backend running securely ✅");
 });
 
 
@@ -136,15 +120,9 @@ app.post("/register", async (req, res) => {
     "INSERT INTO users (username, password) VALUES (?, ?)",
     [username, hashed],
     function(err) {
+      if (err) return res.status(400).json({ error: "Username exists" });
 
-      if (err)
-        return res.status(400).json({ error: "Username exists" });
-
-      res.json({
-        message: "User created",
-        userId: this.lastID
-      });
-
+      res.json({ message: "User created" });
     }
   );
 
@@ -156,39 +134,32 @@ app.post("/login", (req, res) => {
 
   const { username, password } = req.body;
 
-  db.get(
-    "SELECT * FROM users WHERE username = ?",
-    [username],
-    async (err, user) => {
+  db.get("SELECT * FROM users WHERE username = ?", [username], async (err, user) => {
 
-      if (!user)
-        return res.status(400).json({ error: "Invalid login" });
+    if (!user) return res.status(400).json({ error: "Invalid login" });
 
-      const valid = await bcrypt.compare(password, user.password);
+    const valid = await bcrypt.compare(password, user.password);
+    if (!valid) return res.status(400).json({ error: "Invalid login" });
 
-      if (!valid)
-        return res.status(400).json({ error: "Invalid login" });
+    const token = jwt.sign({
+      id: user.id,
+      username: user.username,
+      isAdmin: user.isAdmin
+    },
+    JWT_SECRET,
+    { expiresIn: "7d" });
 
-      const token = jwt.sign({
-        id: user.id,
-        username: user.username,
-        isAdmin: user.isAdmin
-      },
-      JWT_SECRET,
-      { expiresIn: "7d" });
+    res.json({ token });
 
-      res.json({
-        token,
-        isAdmin: user.isAdmin
-      });
-
-    }
-  );
+  });
 
 });
 
 
 // CREATE MISSION (ADMIN ONLY)
+// $2 report fee already paid on frontend
+// Platform keeps 20% on payout later
+
 app.post("/missions",
   authenticateToken,
   requireAdmin,
@@ -196,29 +167,29 @@ app.post("/missions",
 
     const { target, reason, amount } = req.body;
 
+    if (!target || !reason || !amount)
+      return res.status(400).json({ error: "Missing fields" });
+
     db.run(
       "INSERT INTO missions (target, reason, amount, createdBy) VALUES (?, ?, ?, ?)",
       [target, reason, amount, req.user.id],
       function(err) {
+        if (err) return res.status(500).json({ error: "Error creating mission" });
 
-        if (err)
-          return res.status(500).json({ error: err });
-
-        res.json({
-          message: "Mission created",
-          missionId: this.lastID
-        });
-
+        res.json({ message: "Mission created" });
       }
     );
 
 });
 
 
-// GET MISSIONS
+// GET MISSIONS (AUTO REMOVE AFTER 20 DAYS)
 app.get("/missions", (req, res) => {
 
-  db.all("SELECT * FROM missions", (err, rows) => {
+  db.all(`
+    SELECT * FROM missions
+    WHERE createdAt >= datetime('now','-20 days')
+  `, (err, rows) => {
 
     res.json(rows);
 
@@ -227,25 +198,24 @@ app.get("/missions", (req, res) => {
 });
 
 
-// CLAIM MISSION
+// CLAIM
 app.post("/claims",
   authenticateToken,
   (req, res) => {
 
     const { missionId, clip, paypal } = req.body;
 
+    if (!missionId || !clip || !paypal)
+      return res.status(400).json({ error: "Missing fields" });
+
     db.run(
-      "INSERT INTO claims (missionId, clip, paypal) VALUES (?, ?, ?)",
-      [missionId, clip, paypal],
+      "INSERT INTO claims (missionId, userId, clip, paypal) VALUES (?, ?, ?, ?)",
+      [missionId, req.user.id, clip, paypal],
       function(err) {
 
-        if (err)
-          return res.status(500).json({ error: err });
+        if (err) return res.status(500).json({ error: "Claim failed" });
 
-        res.json({
-          message: "Claim submitted",
-          claimId: this.lastID
-        });
+        res.json({ message: "Claim submitted" });
 
       }
     );
@@ -253,51 +223,60 @@ app.post("/claims",
 });
 
 
-// ADMIN GET CLAIMS
-app.get("/claims",
+// APPROVE CLAIM
+app.post("/claims/:id/approve",
   authenticateToken,
   requireAdmin,
   (req, res) => {
 
-    db.all("SELECT * FROM claims", (err, rows) => {
+    const claimId = req.params.id;
 
-      res.json(rows);
+    db.get("SELECT * FROM claims WHERE id = ?", [claimId], (err, claim) => {
+
+      if (!claim) return res.status(404).json({ error: "Not found" });
+
+      db.run("UPDATE claims SET status='approved' WHERE id=?", [claimId]);
+
+      // Update rank
+      db.get("SELECT * FROM users WHERE id=?", [claim.userId], (err, user) => {
+
+        let newCount = user.claimsCount + 1;
+        let newRank = "Bronze";
+
+        if (newCount === 1) newRank = "Bronze";
+        else if (newCount === 2) newRank = "Silver";
+        else if (newCount === 3) newRank = "Gold";
+        else if (newCount === 4) newRank = "Platinum";
+        else if (newCount >= 5) newRank = "Legend";
+
+        db.run(
+          "UPDATE users SET claimsCount=?, rank=? WHERE id=?",
+          [newCount, newRank, user.id]
+        );
+
+        res.json({ message: "Claim approved & rank updated" });
+
+      });
 
     });
 
 });
 
 
-// APPROVE CLAIM (READY FOR PAYPAL PAYOUT)
-app.post("/claims/:id/approve",
-  authenticateToken,
-  requireAdmin,
-  async (req, res) => {
+// LEADERBOARD
+app.get("/leaderboard", (req, res) => {
 
-    const claimId = req.params.id;
-
-    db.run(
-      "UPDATE claims SET status = 'approved' WHERE id = ?",
-      [claimId],
-      function(err) {
-
-        if (err)
-          return res.status(500).json({ error: err });
-
-        res.json({
-          message: "Claim approved — ready for PayPal payout"
-        });
-
-      }
-    );
+  db.all(
+    "SELECT username, claimsCount, rank FROM users ORDER BY claimsCount DESC",
+    (err, rows) => {
+      res.json(rows);
+    }
+  );
 
 });
 
 
-// ================= START SERVER =================
-
+// START
 app.listen(PORT, () => {
-
-  console.log(`Backend running on port ${PORT}`);
-
+  console.log("Server running on port " + PORT);
 });
