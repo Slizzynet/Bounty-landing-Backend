@@ -102,6 +102,13 @@ async function getPayPalAccessToken() {
   );
 
   const data = await response.json();
+
+  console.log("PAYPAL TOKEN RESPONSE:", data);
+
+  if (!data.access_token) {
+    throw new Error("Failed to get PayPal access token");
+  }
+
   return data.access_token;
 }
 
