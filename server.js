@@ -17,15 +17,17 @@ const PAYPAL_CLIENT_SECRET = process.env.PAYPAL_CLIENT_SECRET;
 /* ------------------ DATABASE SETUP ------------------ */
 
 db.serialize(() => {
+
   db.run(`
     CREATE TABLE IF NOT EXISTS users (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       username TEXT UNIQUE,
-      password TEXT
+      password TEXT,
+      agreed_terms INTEGER DEFAULT 0,
+      is_adult INTEGER DEFAULT 0
     )
   `);
 
-  // UPDATED missions table
   db.run(`
     CREATE TABLE IF NOT EXISTS missions (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -50,22 +52,36 @@ db.serialize(() => {
       status TEXT DEFAULT 'pending'
     )
   `);
+
 });
 
 /* ------------------ AUTH ------------------ */
 
 app.post("/register", async (req, res) => {
-  const { username, password } = req.body;
-  const hashed = await bcrypt.hash(password, 10);
+  const { username, password, agreedTerms, isAdult } = req.body;
 
-  db.run(
-    `INSERT INTO users (username, password) VALUES (?, ?)`,
-    [username, hashed],
-    function (err) {
-      if (err) return res.status(400).json({ error: "Username taken" });
-      res.json({ message: "Registered" });
-    }
-  );
+  if (!agreedTerms || !isAdult) {
+    return res.status(400).json({
+      error: "You must agree to Terms and confirm you are 18+ to register."
+    });
+  }
+
+  try {
+    const hashed = await bcrypt.hash(password, 10);
+
+    db.run(
+      `INSERT INTO users (username, password, agreed_terms, is_adult)
+       VALUES (?, ?, ?, ?)`,
+      [username, hashed, 1, 1],
+      function (err) {
+        if (err) return res.status(400).json({ error: "Username taken" });
+        res.json({ message: "Registered successfully" });
+      }
+    );
+
+  } catch (err) {
+    res.status(500).json({ error: "Registration failed" });
+  }
 });
 
 app.post("/login", (req, res) => {
@@ -86,7 +102,7 @@ app.post("/login", (req, res) => {
   );
 });
 
-/* ------------------ PAYPAL AUTH ------------------ */
+/* ------------------ PAYPAL AUTH (LIVE) ------------------ */
 
 async function getPayPalAccessToken() {
   const auth = Buffer.from(
@@ -94,7 +110,7 @@ async function getPayPalAccessToken() {
   ).toString("base64");
 
   const response = await fetch(
-    "https://api-m.sandbox.paypal.com/v1/oauth2/token",
+    "https://api-m.paypal.com/v1/oauth2/token",
     {
       method: "POST",
       headers: {
@@ -108,6 +124,7 @@ async function getPayPalAccessToken() {
   const data = await response.json();
 
   if (!data.access_token) {
+    console.error("PayPal token error:", data);
     throw new Error("Failed to get PayPal access token");
   }
 
@@ -127,7 +144,7 @@ app.post("/create-order", async (req, res) => {
     const accessToken = await getPayPalAccessToken();
 
     const response = await fetch(
-      "https://api-m.sandbox.paypal.com/v2/checkout/orders",
+      "https://api-m.paypal.com/v2/checkout/orders",
       {
         method: "POST",
         headers: {
@@ -153,7 +170,11 @@ app.post("/create-order", async (req, res) => {
 
     const order = await response.json();
 
-    // Store mission as pending payment
+    if (!order.id) {
+      console.error("PayPal order error:", order);
+      return res.status(500).json({ error: "PayPal order failed" });
+    }
+
     const expiresAt = new Date();
     expiresAt.setDate(expiresAt.getDate() + 20);
 
@@ -189,7 +210,7 @@ app.post("/capture-order", async (req, res) => {
     const accessToken = await getPayPalAccessToken();
 
     const response = await fetch(
-      `https://api-m.sandbox.paypal.com/v2/checkout/orders/${orderId}/capture`,
+      `https://api-m.paypal.com/v2/checkout/orders/${orderId}/capture`,
       {
         method: "POST",
         headers: {
@@ -216,23 +237,17 @@ app.post("/capture-order", async (req, res) => {
   }
 });
 
-/* ------------------ GET MISSIONS ------------------ */
+/* ------------------ GET ACTIVE MISSIONS ------------------ */
 
 app.get("/missions", (req, res) => {
-  db.all(`SELECT * FROM missions`, [], (err, rows) => {
-    if (err) return res.status(500).json({ error: "Fetch failed" });
-
-    const now = new Date();
-
-    const updated = rows.map((m) => {
-      if (new Date(m.expires_at) < now && m.status === "active") {
-        m.status = "expired";
-      }
-      return m;
-    });
-
-    res.json(updated);
-  });
+  db.all(
+    `SELECT * FROM missions WHERE status = 'active'`,
+    [],
+    (err, rows) => {
+      if (err) return res.status(500).json({ error: "Fetch failed" });
+      res.json(rows);
+    }
+  );
 });
 
 /* ------------------ CLAIMS ------------------ */
@@ -259,5 +274,5 @@ app.post("/claims", (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log("Production backend running ✅");
+  console.log("LIVE backend running 🚀");
 });
