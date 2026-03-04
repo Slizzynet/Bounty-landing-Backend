@@ -133,7 +133,7 @@ app.post("/create-order", async (req, res) => {
             {
               amount: {
                 currency_code: "USD",
-                value: amount
+                value: (Number(amount) + 2).toFixed(2)
               }
             }
           ],
