@@ -102,7 +102,6 @@ async function getPayPalAccessToken() {
   );
 
   const data = await response.json();
-
   console.log("PAYPAL TOKEN RESPONSE:", data);
 
   if (!data.access_token) {
@@ -137,15 +136,50 @@ app.post("/create-order", async (req, res) => {
                 value: amount
               }
             }
-          ]
+          ],
+          application_context: {
+            shipping_preference: "NO_SHIPPING"
+          }
         })
       }
     );
 
     const order = await response.json();
+    console.log("PAYPAL ORDER RESPONSE:", order);
+
     res.json(order);
   } catch (err) {
+    console.error("PayPal order failed:", err);
     res.status(500).json({ error: "PayPal order failed" });
+  }
+});
+
+/* ------------------ CAPTURE PAYPAL ORDER ------------------ */
+
+app.post("/capture-order", async (req, res) => {
+  const { orderId } = req.body;
+
+  try {
+    const accessToken = await getPayPalAccessToken();
+
+    const response = await fetch(
+      `https://api-m.sandbox.paypal.com/v2/checkout/orders/${orderId}/capture`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${accessToken}`
+        }
+      }
+    );
+
+    const data = await response.json();
+    console.log("PAYPAL CAPTURE RESPONSE:", data);
+
+    res.json(data);
+  } catch (err) {
+    console.error("Capture failed:", err);
+    res.status(500).json({ error: "Capture failed" });
   }
 });
 
@@ -163,7 +197,6 @@ app.post("/missions", (req, res) => {
     [target, reason, amount, expiresAt.toISOString()],
     function (err) {
       if (err) return res.status(500).json({ error: "Creation failed" });
-
       res.json({ message: "Mission created", id: this.lastID });
     }
   );
@@ -202,35 +235,6 @@ app.post("/claims", (req, res) => {
       });
     }
   );
-});
-/* ------------------ CAPTURE PAYPAL ORDER ------------------ */
-
-app.post("/capture-order", async (req, res) => {
-  const { orderId } = req.body;
-
-  try {
-    const accessToken = await getPayPalAccessToken();
-
-    const response = await fetch(
-      `https://api-m.sandbox.paypal.com/v2/checkout/orders/${orderId}/capture`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${accessToken}`
-        }
-      }
-    );
-
-    const data = await response.json();
-
-    console.log("PAYPAL CAPTURE RESPONSE:", data);
-
-    res.json(data);
-  } catch (err) {
-    console.error("Capture failed:", err);
-    res.status(500).json({ error: "Capture failed" });
-  }
 });
 
 /* ------------------ START SERVER ------------------ */
