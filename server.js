@@ -25,15 +25,19 @@ db.serialize(() => {
     )
   `);
 
+  // UPDATED missions table
   db.run(`
     CREATE TABLE IF NOT EXISTS missions (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       target TEXT,
       reason TEXT,
-      amount REAL,
+      bounty_amount REAL,
+      listing_fee REAL,
+      total_charged REAL,
+      paypal_order_id TEXT,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       expires_at DATETIME,
-      status TEXT DEFAULT 'active'
+      status TEXT DEFAULT 'pending_payment'
     )
   `);
 
@@ -102,7 +106,6 @@ async function getPayPalAccessToken() {
   );
 
   const data = await response.json();
-  console.log("PAYPAL TOKEN RESPONSE:", data);
 
   if (!data.access_token) {
     throw new Error("Failed to get PayPal access token");
@@ -114,9 +117,13 @@ async function getPayPalAccessToken() {
 /* ------------------ CREATE PAYPAL ORDER ------------------ */
 
 app.post("/create-order", async (req, res) => {
-  const { amount } = req.body;
+  const { target, reason, amount } = req.body;
 
   try {
+    const bountyAmount = Number(amount);
+    const listingFee = 2;
+    const totalAmount = (bountyAmount + listingFee).toFixed(2);
+
     const accessToken = await getPayPalAccessToken();
 
     const response = await fetch(
@@ -133,7 +140,7 @@ app.post("/create-order", async (req, res) => {
             {
               amount: {
                 currency_code: "USD",
-                value: (Number(amount) + 2).toFixed(2)
+                value: totalAmount
               }
             }
           ],
@@ -145,9 +152,28 @@ app.post("/create-order", async (req, res) => {
     );
 
     const order = await response.json();
-    console.log("PAYPAL ORDER RESPONSE:", order);
+
+    // Store mission as pending payment
+    const expiresAt = new Date();
+    expiresAt.setDate(expiresAt.getDate() + 20);
+
+    db.run(
+      `INSERT INTO missions 
+      (target, reason, bounty_amount, listing_fee, total_charged, paypal_order_id, expires_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [
+        target,
+        reason,
+        bountyAmount,
+        listingFee,
+        totalAmount,
+        order.id,
+        expiresAt.toISOString()
+      ]
+    );
 
     res.json(order);
+
   } catch (err) {
     console.error("PayPal order failed:", err);
     res.status(500).json({ error: "PayPal order failed" });
@@ -174,36 +200,28 @@ app.post("/capture-order", async (req, res) => {
     );
 
     const data = await response.json();
-    console.log("PAYPAL CAPTURE RESPONSE:", data);
+
+    if (data.status === "COMPLETED") {
+      db.run(
+        `UPDATE missions SET status = 'active' WHERE paypal_order_id = ?`,
+        [orderId]
+      );
+    }
 
     res.json(data);
+
   } catch (err) {
     console.error("Capture failed:", err);
     res.status(500).json({ error: "Capture failed" });
   }
 });
 
-/* ------------------ MISSIONS ------------------ */
-
-app.post("/missions", (req, res) => {
-  const { target, reason, amount } = req.body;
-
-  const expiresAt = new Date();
-  expiresAt.setDate(expiresAt.getDate() + 20);
-
-  db.run(
-    `INSERT INTO missions (target, reason, amount, expires_at)
-     VALUES (?, ?, ?, ?)`,
-    [target, reason, amount, expiresAt.toISOString()],
-    function (err) {
-      if (err) return res.status(500).json({ error: "Creation failed" });
-      res.json({ message: "Mission created", id: this.lastID });
-    }
-  );
-});
+/* ------------------ GET MISSIONS ------------------ */
 
 app.get("/missions", (req, res) => {
   db.all(`SELECT * FROM missions`, [], (err, rows) => {
+    if (err) return res.status(500).json({ error: "Fetch failed" });
+
     const now = new Date();
 
     const updated = rows.map((m) => {
@@ -231,7 +249,7 @@ app.post("/claims", (req, res) => {
 
       res.json({
         message:
-          "Claim submitted. Approved claimants receive 80% of mission reward. Platform retains 20% service fee."
+          "Claim submitted. Approved claimants receive 80% of bounty reward. Platform retains 20% service fee."
       });
     }
   );
