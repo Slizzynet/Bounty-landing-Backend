@@ -203,6 +203,35 @@ app.post("/claims", (req, res) => {
     }
   );
 });
+/* ------------------ CAPTURE PAYPAL ORDER ------------------ */
+
+app.post("/capture-order", async (req, res) => {
+  const { orderId } = req.body;
+
+  try {
+    const accessToken = await getPayPalAccessToken();
+
+    const response = await fetch(
+      `https://api-m.sandbox.paypal.com/v2/checkout/orders/${orderId}/capture`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${accessToken}`
+        }
+      }
+    );
+
+    const data = await response.json();
+
+    console.log("PAYPAL CAPTURE RESPONSE:", data);
+
+    res.json(data);
+  } catch (err) {
+    console.error("Capture failed:", err);
+    res.status(500).json({ error: "Capture failed" });
+  }
+});
 
 /* ------------------ START SERVER ------------------ */
 
