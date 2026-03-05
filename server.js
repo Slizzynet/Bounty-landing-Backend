@@ -24,7 +24,8 @@ db.serialize(() => {
       username TEXT UNIQUE,
       password TEXT,
       agreed_terms INTEGER DEFAULT 0,
-      is_adult INTEGER DEFAULT 0
+      is_adult INTEGER DEFAULT 0,
+      agreed_at DATETIME
     )
   `);
 
@@ -60,27 +61,56 @@ db.serialize(() => {
 app.post("/register", async (req, res) => {
   const { username, password, agreedTerms, isAdult } = req.body;
 
+  if (!username || !password) {
+    return res.status(400).json({ error: "Username and password required." });
+  }
+
   if (!agreedTerms || !isAdult) {
     return res.status(400).json({
-      error: "You must agree to Terms and confirm you are 18+ to register."
+      error: "You must agree to Terms and confirm you are 18+."
     });
   }
 
   try {
-    const hashed = await bcrypt.hash(password, 10);
 
-    db.run(
-      `INSERT INTO users (username, password, agreed_terms, is_adult)
-       VALUES (?, ?, ?, ?)`,
-      [username, hashed, 1, 1],
-      function (err) {
-        if (err) return res.status(400).json({ error: "Username taken" });
-        res.json({ message: "Registered successfully" });
+    // 🔒 CHECK FOR DUPLICATE USERNAME
+    db.get(
+      `SELECT id FROM users WHERE username = ?`,
+      [username],
+      async (err, existingUser) => {
+
+        if (existingUser) {
+          return res.status(400).json({
+            error: "Username already taken."
+          });
+        }
+
+        const hashed = await bcrypt.hash(password, 10);
+
+        db.run(
+          `INSERT INTO users 
+           (username, password, agreed_terms, is_adult, agreed_at)
+           VALUES (?, ?, ?, ?, ?)`,
+          [
+            username,
+            hashed,
+            1,
+            1,
+            new Date().toISOString()
+          ],
+          function (err) {
+            if (err) {
+              return res.status(500).json({ error: "Registration failed." });
+            }
+            res.json({ message: "Registered successfully" });
+          }
+        );
+
       }
     );
 
   } catch (err) {
-    res.status(500).json({ error: "Registration failed" });
+    res.status(500).json({ error: "Registration failed." });
   }
 });
 
@@ -137,7 +167,15 @@ app.post("/create-order", async (req, res) => {
   const { target, reason, amount } = req.body;
 
   try {
+
     const bountyAmount = Number(amount);
+
+    if (!bountyAmount || bountyAmount <= 0) {
+      return res.status(400).json({
+        error: "Bounty amount must be greater than 0."
+      });
+    }
+
     const listingFee = 2;
     const totalAmount = (bountyAmount + listingFee).toFixed(2);
 
