@@ -3,6 +3,8 @@ const sqlite3 = require("sqlite3").verbose();
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 const cors = require("cors");
+const cloudinary = require("cloudinary").v2;
+const multer = require("multer");
 
 const app = express();
 app.use(express.json());
@@ -13,6 +15,29 @@ const db = new sqlite3.Database("./database.db");
 const JWT_SECRET = process.env.JWT_SECRET;
 const PAYPAL_CLIENT_ID = process.env.PAYPAL_CLIENT_ID;
 const PAYPAL_CLIENT_SECRET = process.env.PAYPAL_CLIENT_SECRET;
+
+/* ------------------ CLOUDINARY CONFIG ------------------ */
+
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET
+});
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 50 * 1024 * 1024 }, // 50MB
+  fileFilter: (req, file, cb) => {
+    if (
+      file.mimetype.startsWith("image/") ||
+      file.mimetype.startsWith("video/")
+    ) {
+      cb(null, true);
+    } else {
+      cb(new Error("Only images and videos are allowed."));
+    }
+  }
+});
 
 /* ------------------ DATABASE SETUP ------------------ */
 
@@ -72,8 +97,6 @@ app.post("/register", async (req, res) => {
   }
 
   try {
-
-    // 🔒 CHECK FOR DUPLICATE USERNAME
     db.get(
       `SELECT id FROM users WHERE username = ?`,
       [username],
@@ -105,10 +128,8 @@ app.post("/register", async (req, res) => {
             res.json({ message: "Registered successfully" });
           }
         );
-
       }
     );
-
   } catch (err) {
     res.status(500).json({ error: "Registration failed." });
   }
@@ -132,7 +153,7 @@ app.post("/login", (req, res) => {
   );
 });
 
-/* ------------------ PAYPAL AUTH (LIVE) ------------------ */
+/* ------------------ PAYPAL AUTH ------------------ */
 
 async function getPayPalAccessToken() {
   const auth = Buffer.from(
@@ -154,20 +175,18 @@ async function getPayPalAccessToken() {
   const data = await response.json();
 
   if (!data.access_token) {
-    console.error("PayPal token error:", data);
     throw new Error("Failed to get PayPal access token");
   }
 
   return data.access_token;
 }
 
-/* ------------------ CREATE PAYPAL ORDER ------------------ */
+/* ------------------ CREATE ORDER ------------------ */
 
 app.post("/create-order", async (req, res) => {
   const { target, reason, amount } = req.body;
 
   try {
-
     const bountyAmount = Number(amount);
 
     if (!bountyAmount || bountyAmount <= 0) {
@@ -198,10 +217,7 @@ app.post("/create-order", async (req, res) => {
                 value: totalAmount
               }
             }
-          ],
-          application_context: {
-            shipping_preference: "NO_SHIPPING"
-          }
+          ]
         })
       }
     );
@@ -209,7 +225,6 @@ app.post("/create-order", async (req, res) => {
     const order = await response.json();
 
     if (!order.id) {
-      console.error("PayPal order error:", order);
       return res.status(500).json({ error: "PayPal order failed" });
     }
 
@@ -234,12 +249,11 @@ app.post("/create-order", async (req, res) => {
     res.json(order);
 
   } catch (err) {
-    console.error("PayPal order failed:", err);
     res.status(500).json({ error: "PayPal order failed" });
   }
 });
 
-/* ------------------ CAPTURE PAYPAL ORDER ------------------ */
+/* ------------------ CAPTURE ORDER ------------------ */
 
 app.post("/capture-order", async (req, res) => {
   const { orderId } = req.body;
@@ -270,12 +284,11 @@ app.post("/capture-order", async (req, res) => {
     res.json(data);
 
   } catch (err) {
-    console.error("Capture failed:", err);
     res.status(500).json({ error: "Capture failed" });
   }
 });
 
-/* ------------------ GET ACTIVE MISSIONS ------------------ */
+/* ------------------ GET MISSIONS ------------------ */
 
 app.get("/missions", (req, res) => {
   db.all(
@@ -288,24 +301,50 @@ app.get("/missions", (req, res) => {
   );
 });
 
-/* ------------------ CLAIMS ------------------ */
+/* ------------------ CLAIMS (CLOUDINARY) ------------------ */
 
-app.post("/claims", (req, res) => {
-  const { missionId, clip, paypal } = req.body;
+app.post("/claims", upload.single("file"), async (req, res) => {
+  try {
+    const { missionId, paypal } = req.body;
 
-  db.run(
-    `INSERT INTO claims (mission_id, clip, paypal_email)
-     VALUES (?, ?, ?)`,
-    [missionId, clip, paypal],
-    function (err) {
-      if (err) return res.status(500).json({ error: "Claim failed" });
-
-      res.json({
-        message:
-          "Claim submitted. Approved claimants receive 80% of bounty reward. Platform retains 20% service fee."
-      });
+    if (!req.file) {
+      return res.status(400).json({ error: "No file uploaded." });
     }
-  );
+
+    const result = await new Promise((resolve, reject) => {
+      cloudinary.uploader.upload_stream(
+        {
+          resource_type: "auto",
+          folder: "mission_proofs",
+          quality: "auto",
+          fetch_format: "auto"
+        },
+        (error, result) => {
+          if (error) reject(error);
+          else resolve(result);
+        }
+      ).end(req.file.buffer);
+    });
+
+    db.run(
+      `INSERT INTO claims (mission_id, clip, paypal_email)
+       VALUES (?, ?, ?)`,
+      [missionId, result.secure_url, paypal],
+      function (err) {
+        if (err) {
+          return res.status(500).json({ error: "Claim failed" });
+        }
+
+        res.json({
+          message: "Proof uploaded successfully.",
+          mediaUrl: result.secure_url
+        });
+      }
+    );
+
+  } catch (err) {
+    res.status(500).json({ error: err.message || "Upload failed." });
+  }
 });
 
 /* ------------------ START SERVER ------------------ */
