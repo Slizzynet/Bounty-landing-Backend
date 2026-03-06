@@ -3,14 +3,23 @@ const sqlite3 = require("sqlite3").verbose();
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 const cors = require("cors");
+const fetch = require("node-fetch");
+const multer = require("multer");
+const path = require("path");
 
 const app = express();
 app.use(express.json());
 app.use(cors());
+app.use("/uploads", express.static("uploads"));
+
+const upload = multer({ dest: "uploads/" });
 
 const db = new sqlite3.Database("./database.db");
 
 const JWT_SECRET = process.env.JWT_SECRET || "secret";
+
+const PAYPAL_CLIENT = process.env.PAYPAL_CLIENT_ID;
+const PAYPAL_SECRET = process.env.PAYPAL_SECRET;
 
 /* ---------------- DATABASE ---------------- */
 
@@ -104,11 +113,84 @@ res.json({token});
 });
 });
 
-/* ---------------- CREATE MISSION ---------------- */
+/* ---------------- PAYPAL TOKEN ---------------- */
 
-app.post("/missions",(req,res)=>{
+async function getPayPalToken(){
+
+const auth = Buffer.from(PAYPAL_CLIENT + ":" + PAYPAL_SECRET).toString("base64");
+
+const res = await fetch("https://api-m.paypal.com/v1/oauth2/token",{
+method:"POST",
+headers:{
+Authorization:`Basic ${auth}`,
+"Content-Type":"application/x-www-form-urlencoded"
+},
+body:"grant_type=client_credentials"
+});
+
+const data = await res.json();
+
+return data.access_token;
+
+}
+
+/* ---------------- CREATE ORDER ---------------- */
+
+app.post("/create-order", async(req,res)=>{
 
 const {target,reason,amount}=req.body;
+
+const total = Number(amount) + 2;
+
+const token = await getPayPalToken();
+
+const response = await fetch("https://api-m.paypal.com/v2/checkout/orders",{
+
+method:"POST",
+
+headers:{
+"Content-Type":"application/json",
+Authorization:`Bearer ${token}`
+},
+
+body:JSON.stringify({
+intent:"CAPTURE",
+purchase_units:[{
+amount:{
+currency_code:"USD",
+value:total.toFixed(2)
+}
+}]
+})
+
+});
+
+const order = await response.json();
+
+order.tempData = {target,reason,amount};
+
+res.json(order);
+
+});
+
+/* ---------------- CAPTURE ORDER ---------------- */
+
+app.post("/capture-order", async(req,res)=>{
+
+const {orderId,target,reason,amount}=req.body;
+
+const token = await getPayPalToken();
+
+await fetch(`https://api-m.paypal.com/v2/checkout/orders/${orderId}/capture`,{
+
+method:"POST",
+
+headers:{
+"Content-Type":"application/json",
+Authorization:`Bearer ${token}`
+}
+
+});
 
 const expires=new Date();
 expires.setDate(expires.getDate()+20);
@@ -116,13 +198,11 @@ expires.setDate(expires.getDate()+20);
 db.run(
 `INSERT INTO missions(target,reason,bounty_amount,expires_at)
 VALUES(?,?,?,?)`,
-[target,reason,amount,expires.toISOString()],
-function(err){
+[target,reason,amount,expires.toISOString()]
+);
 
-if(err) return res.json({error:"Mission creation failed"});
+res.json({message:"Mission created"});
 
-res.json({id:this.lastID});
-});
 });
 
 /* ---------------- GET MISSIONS ---------------- */
@@ -149,6 +229,7 @@ days_remaining:days
 res.json(missions);
 
 });
+
 });
 
 /* ---------------- ADD BOUNTY ---------------- */
@@ -171,13 +252,18 @@ VALUES(?,?,?)`,
 );
 
 res.json({message:"Bounty increased"});
+
 });
 
 /* ---------------- CLAIM ---------------- */
 
-app.post("/claims",(req,res)=>{
+app.post("/claims", upload.single("file"), (req,res)=>{
 
-const {missionId,clip,paypal,hunter}=req.body;
+const missionId=req.body.missionId;
+const paypal=req.body.paypal;
+const hunter=req.body.hunter || "anonymous";
+
+const clip=req.file ? req.file.filename : null;
 
 db.run(
 `INSERT INTO claims(mission_id,clip,paypal_email,hunter)
@@ -188,7 +274,9 @@ function(err){
 if(err) return res.json({error:"Claim failed"});
 
 res.json({message:"Claim submitted"});
+
 });
+
 });
 
 /* ---------------- LIVE PLAYER COUNT ---------------- */
@@ -203,6 +291,7 @@ FROM claims
 res.json({players:row.players || 0});
 
 });
+
 });
 
 /* ---------------- HUNTER LEADERBOARD ---------------- */
@@ -221,6 +310,7 @@ LIMIT 5
 res.json(rows);
 
 });
+
 });
 
 /* ---------------- MOST WANTED ---------------- */
@@ -238,6 +328,7 @@ LIMIT 3
 res.json(rows);
 
 });
+
 });
 
 /* ---------------- SERVER ---------------- */
@@ -245,5 +336,5 @@ res.json(rows);
 const PORT=process.env.PORT||3000;
 
 app.listen(PORT,()=>{
-console.log("Server running");
+console.log("Server running on port "+PORT);
 });
