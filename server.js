@@ -3,8 +3,9 @@ const sqlite3 = require("sqlite3").verbose();
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 const cors = require("cors");
-const cloudinary = require("cloudinary").v2;
 const multer = require("multer");
+const cloudinary = require("cloudinary").v2;
+const streamifier = require("streamifier");
 
 const app = express();
 app.use(express.json());
@@ -16,7 +17,7 @@ const JWT_SECRET = process.env.JWT_SECRET;
 const PAYPAL_CLIENT_ID = process.env.PAYPAL_CLIENT_ID;
 const PAYPAL_CLIENT_SECRET = process.env.PAYPAL_CLIENT_SECRET;
 
-/* ------------------ CLOUDINARY CONFIG ------------------ */
+/* ---------------- CLOUDINARY CONFIG ---------------- */
 
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
@@ -24,22 +25,26 @@ cloudinary.config({
   api_secret: process.env.CLOUDINARY_API_SECRET
 });
 
+/* ---------------- FILE UPLOAD SETUP ---------------- */
+
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 50 * 1024 * 1024 }, // 50MB
+  limits: { fileSize: 50 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
+
     if (
       file.mimetype.startsWith("image/") ||
       file.mimetype.startsWith("video/")
     ) {
       cb(null, true);
     } else {
-      cb(new Error("Only images and videos are allowed."));
+      cb(new Error("Only images or videos allowed"));
     }
+
   }
 });
 
-/* ------------------ DATABASE SETUP ------------------ */
+/* ---------------- DATABASE SETUP ---------------- */
 
 db.serialize(() => {
 
@@ -81,9 +86,10 @@ db.serialize(() => {
 
 });
 
-/* ------------------ AUTH ------------------ */
+/* ---------------- AUTH ---------------- */
 
 app.post("/register", async (req, res) => {
+
   const { username, password, agreedTerms, isAdult } = req.body;
 
   if (!username || !password) {
@@ -96,66 +102,78 @@ app.post("/register", async (req, res) => {
     });
   }
 
-  try {
-    db.get(
-      `SELECT id FROM users WHERE username = ?`,
-      [username],
-      async (err, existingUser) => {
+  db.get(
+    `SELECT id FROM users WHERE username = ?`,
+    [username],
+    async (err, existingUser) => {
 
-        if (existingUser) {
-          return res.status(400).json({
-            error: "Username already taken."
-          });
-        }
-
-        const hashed = await bcrypt.hash(password, 10);
-
-        db.run(
-          `INSERT INTO users 
-           (username, password, agreed_terms, is_adult, agreed_at)
-           VALUES (?, ?, ?, ?, ?)`,
-          [
-            username,
-            hashed,
-            1,
-            1,
-            new Date().toISOString()
-          ],
-          function (err) {
-            if (err) {
-              return res.status(500).json({ error: "Registration failed." });
-            }
-            res.json({ message: "Registered successfully" });
-          }
-        );
+      if (existingUser) {
+        return res.status(400).json({
+          error: "Username already taken."
+        });
       }
-    );
-  } catch (err) {
-    res.status(500).json({ error: "Registration failed." });
-  }
+
+      const hashed = await bcrypt.hash(password, 10);
+
+      db.run(
+        `INSERT INTO users 
+        (username, password, agreed_terms, is_adult, agreed_at)
+        VALUES (?, ?, ?, ?, ?)`,
+        [
+          username,
+          hashed,
+          1,
+          1,
+          new Date().toISOString()
+        ],
+        function (err) {
+
+          if (err) {
+            return res.status(500).json({
+              error: "Registration failed."
+            });
+          }
+
+          res.json({
+            message: "Registered successfully"
+          });
+
+        }
+      );
+
+    }
+  );
+
 });
 
 app.post("/login", (req, res) => {
+
   const { username, password } = req.body;
 
   db.get(
     `SELECT * FROM users WHERE username = ?`,
     [username],
     async (err, user) => {
+
       if (!user) return res.status(400).json({ error: "Invalid login" });
 
       const valid = await bcrypt.compare(password, user.password);
+
       if (!valid) return res.status(400).json({ error: "Invalid login" });
 
       const token = jwt.sign({ id: user.id }, JWT_SECRET);
+
       res.json({ token });
+
     }
   );
+
 });
 
-/* ------------------ PAYPAL AUTH ------------------ */
+/* ---------------- PAYPAL AUTH ---------------- */
 
 async function getPayPalAccessToken() {
+
   const auth = Buffer.from(
     PAYPAL_CLIENT_ID + ":" + PAYPAL_CLIENT_SECRET
   ).toString("base64");
@@ -175,23 +193,27 @@ async function getPayPalAccessToken() {
   const data = await response.json();
 
   if (!data.access_token) {
-    throw new Error("Failed to get PayPal access token");
+    console.error("PayPal token error:", data);
+    throw new Error("Failed to get PayPal token");
   }
 
   return data.access_token;
+
 }
 
-/* ------------------ CREATE ORDER ------------------ */
+/* ---------------- CREATE ORDER ---------------- */
 
 app.post("/create-order", async (req, res) => {
+
   const { target, reason, amount } = req.body;
 
   try {
+
     const bountyAmount = Number(amount);
 
     if (!bountyAmount || bountyAmount <= 0) {
       return res.status(400).json({
-        error: "Bounty amount must be greater than 0."
+        error: "Bounty must be greater than 0"
       });
     }
 
@@ -217,22 +239,21 @@ app.post("/create-order", async (req, res) => {
                 value: totalAmount
               }
             }
-          ]
+          ],
+          application_context: {
+            shipping_preference: "NO_SHIPPING"
+          }
         })
       }
     );
 
     const order = await response.json();
 
-    if (!order.id) {
-      return res.status(500).json({ error: "PayPal order failed" });
-    }
-
     const expiresAt = new Date();
     expiresAt.setDate(expiresAt.getDate() + 20);
 
     db.run(
-      `INSERT INTO missions 
+      `INSERT INTO missions
       (target, reason, bounty_amount, listing_fee, total_charged, paypal_order_id, expires_at)
       VALUES (?, ?, ?, ?, ?, ?, ?)`,
       [
@@ -249,16 +270,25 @@ app.post("/create-order", async (req, res) => {
     res.json(order);
 
   } catch (err) {
-    res.status(500).json({ error: "PayPal order failed" });
+
+    console.error(err);
+
+    res.status(500).json({
+      error: "PayPal order failed"
+    });
+
   }
+
 });
 
-/* ------------------ CAPTURE ORDER ------------------ */
+/* ---------------- CAPTURE PAYMENT ---------------- */
 
 app.post("/capture-order", async (req, res) => {
+
   const { orderId } = req.body;
 
   try {
+
     const accessToken = await getPayPalAccessToken();
 
     const response = await fetch(
@@ -266,8 +296,8 @@ app.post("/capture-order", async (req, res) => {
       {
         method: "POST",
         headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${accessToken}`
+          Authorization: `Bearer ${accessToken}`,
+          "Content-Type": "application/json"
         }
       }
     );
@@ -275,81 +305,127 @@ app.post("/capture-order", async (req, res) => {
     const data = await response.json();
 
     if (data.status === "COMPLETED") {
+
       db.run(
-        `UPDATE missions SET status = 'active' WHERE paypal_order_id = ?`,
+        `UPDATE missions 
+         SET status = 'active'
+         WHERE paypal_order_id = ?`,
         [orderId]
       );
+
     }
 
     res.json(data);
 
   } catch (err) {
-    res.status(500).json({ error: "Capture failed" });
+
+    console.error(err);
+
+    res.status(500).json({
+      error: "Capture failed"
+    });
+
   }
+
 });
 
-/* ------------------ GET MISSIONS ------------------ */
+/* ---------------- GET MISSIONS ---------------- */
 
 app.get("/missions", (req, res) => {
+
   db.all(
-    `SELECT * FROM missions WHERE status = 'active'`,
+    `SELECT * FROM missions WHERE status='active'`,
     [],
     (err, rows) => {
-      if (err) return res.status(500).json({ error: "Fetch failed" });
+
+      if (err) {
+        return res.status(500).json({
+          error: "Failed to fetch missions"
+        });
+      }
+
       res.json(rows);
+
     }
   );
+
 });
 
-/* ------------------ CLAIMS (CLOUDINARY) ------------------ */
+/* ---------------- CLAIM WITH VIDEO/IMAGE ---------------- */
 
-app.post("/claims", upload.single("file"), async (req, res) => {
-  try {
-    const { missionId, paypal } = req.body;
+app.post("/claims", upload.single("proof"), async (req, res) => {
 
-    if (!req.file) {
-      return res.status(400).json({ error: "No file uploaded." });
-    }
+  const { missionId, paypal } = req.body;
 
-    const result = await new Promise((resolve, reject) => {
-      cloudinary.uploader.upload_stream(
-        {
-          resource_type: "auto",
-          folder: "mission_proofs",
-          quality: "auto",
-          fetch_format: "auto"
-        },
-        (error, result) => {
-          if (error) reject(error);
-          else resolve(result);
-        }
-      ).end(req.file.buffer);
+  if (!req.file) {
+    return res.status(400).json({
+      error: "Proof image or video required"
     });
+  }
+
+  try {
+
+    const streamUpload = () => {
+
+      return new Promise((resolve, reject) => {
+
+        const stream = cloudinary.uploader.upload_stream(
+          { resource_type: "auto", folder: "mission_proofs" },
+          (error, result) => {
+
+            if (result) resolve(result);
+            else reject(error);
+
+          }
+        );
+
+        streamifier.createReadStream(req.file.buffer).pipe(stream);
+
+      });
+
+    };
+
+    const uploaded = await streamUpload();
+
+    const clipUrl = uploaded.secure_url;
 
     db.run(
       `INSERT INTO claims (mission_id, clip, paypal_email)
        VALUES (?, ?, ?)`,
-      [missionId, result.secure_url, paypal],
+      [missionId, clipUrl, paypal],
       function (err) {
+
         if (err) {
-          return res.status(500).json({ error: "Claim failed" });
+          return res.status(500).json({
+            error: "Claim failed"
+          });
         }
 
         res.json({
-          message: "Proof uploaded successfully.",
-          mediaUrl: result.secure_url
+          message:
+            "Claim submitted. Approved claimants receive 80% of bounty reward. Platform retains 20% service fee.",
+          proof: clipUrl
         });
+
       }
     );
 
-  } catch (err) {
-    res.status(500).json({ error: err.message || "Upload failed." });
+  } catch (error) {
+
+    console.error("Upload failed:", error);
+
+    res.status(500).json({
+      error: "Upload failed"
+    });
+
   }
+
 });
 
-/* ------------------ START SERVER ------------------ */
+/* ---------------- START SERVER ---------------- */
 
 const PORT = process.env.PORT || 3000;
+
 app.listen(PORT, () => {
   console.log("LIVE backend running 🚀");
 });
