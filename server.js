@@ -3,7 +3,6 @@ const sqlite3 = require("sqlite3").verbose();
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 const cors = require("cors");
-const fetch = require("node-fetch");
 const multer = require("multer");
 const path = require("path");
 
