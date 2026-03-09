@@ -4,32 +4,45 @@ const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 const cors = require("cors");
 const multer = require("multer");
-const path = require("path");
 const fetch = require("node-fetch");
-
+const rateLimit = require("express-rate-limit");
 const app = express();
 
 app.use(express.json());
 app.use(cors());
+const limiter = rateLimit({
+windowMs: 15 * 60 * 1000,
+max: 100,
+message: {error:"Too many requests, please slow down"}
+});
+
+app.use(limiter);
 app.use("/uploads", express.static("uploads"));
 
-const upload = multer({ dest: "uploads/" });
+const upload = multer({
+dest:"uploads/",
+limits:{fileSize:50 * 1024 * 1024}
+});
 
 const db = new sqlite3.Database("./database.db");
 
 const JWT_SECRET = process.env.JWT_SECRET || "secret";
 
+/* MAKE SURE THESE MATCH YOUR PAYPAL ACCOUNT */
 const PAYPAL_CLIENT = process.env.PAYPAL_CLIENT_ID;
 const PAYPAL_SECRET = process.env.PAYPAL_SECRET;
 
+let activeUsers = {};
+
 /* ---------------- DATABASE ---------------- */
 
-db.serialize(() => {
+db.serialize(()=>{
 
 db.run(`
 CREATE TABLE IF NOT EXISTS users(
 id INTEGER PRIMARY KEY AUTOINCREMENT,
 username TEXT UNIQUE,
+email TEXT UNIQUE,
 password TEXT,
 agreed_terms INTEGER,
 is_adult INTEGER,
@@ -71,9 +84,9 @@ amount REAL
 
 app.post("/register", async (req,res)=>{
 
-const {username,password,agreedTerms,isAdult}=req.body;
+const {username,email,password,agreedTerms,isAdult}=req.body;
 
-if(!username || !password){
+if(!username || !email || !password){
 return res.status(400).json({error:"Missing fields"});
 }
 
@@ -84,12 +97,12 @@ return res.status(400).json({error:"Must accept terms and confirm 18+"});
 const hash = await bcrypt.hash(password,10);
 
 db.run(
-`INSERT INTO users(username,password,agreed_terms,is_adult,agreed_at)
-VALUES(?,?,?,?,datetime('now'))`,
-[username,hash,1,1],
+`INSERT INTO users(username,email,password,agreed_terms,is_adult,agreed_at)
+VALUES(?,?,?,?,?,datetime('now'))`,
+[username,email,hash,1,1],
 function(err){
 
-if(err) return res.json({error:"Username already exists"});
+if(err) return res.json({error:"Username or email already exists"});
 
 res.json({message:"Account created"});
 
@@ -101,11 +114,11 @@ res.json({message:"Account created"});
 
 app.post("/login",(req,res)=>{
 
-const {username,password}=req.body;
+const {email,password}=req.body;
 
 db.get(
-`SELECT * FROM users WHERE username=?`,
-[username],
+`SELECT * FROM users WHERE email=? OR username=?`,
+[email,email],
 async(err,user)=>{
 
 if(!user) return res.json({error:"Invalid login"});
@@ -119,9 +132,72 @@ const token = jwt.sign(
 JWT_SECRET
 );
 
-res.json({token});
+res.json({
+token,
+username:user.username
+});
 
 });
+
+});
+
+/* ---------------- FORGOT PASSWORD ---------------- */
+
+app.post("/forgot-password",(req,res)=>{
+
+const {email} = req.body;
+
+if(!email){
+return res.json({error:"Email required"});
+}
+
+console.log("Password reset requested for:",email);
+
+res.json({
+message:"If the account exists a reset email was sent"
+});
+
+});
+
+/* ---------------- USER COUNT ---------------- */
+
+app.get("/user-count",(req,res)=>{
+
+db.get(`SELECT COUNT(*) as total FROM users`,[],(err,row)=>{
+res.json({total:row.total || 0});
+});
+
+});
+
+/* ---------------- HEARTBEAT ---------------- */
+
+app.post("/heartbeat",(req,res)=>{
+
+const {username} = req.body;
+
+if(username){
+activeUsers[username] = Date.now();
+}
+
+res.json({ok:true});
+
+});
+
+/* ---------------- LIVE COUNT ---------------- */
+
+app.get("/live-count",(req,res)=>{
+
+const now = Date.now();
+
+let count = 0;
+
+for(let user in activeUsers){
+if(now - activeUsers[user] < 60000){
+count++;
+}
+}
+
+res.json({players:count});
 
 });
 
@@ -218,7 +294,7 @@ Authorization:`Bearer ${token}`
 
 const data = await capture.json();
 
-if(data.status !== "COMPLETED"){
+if(!data || data.status !== "COMPLETED"){
 return res.json({error:"Payment not completed"});
 }
 
@@ -235,7 +311,7 @@ res.json({message:"Mission created"});
 
 });
 
-/* ---------------- GET MISSIONS ---------------- */
+/* ---------------- MISSIONS ---------------- */
 
 app.get("/missions",(req,res)=>{
 
@@ -265,13 +341,31 @@ res.json(missions);
 });
 
 /* ---------------- ADD BOUNTY ---------------- */
+app.post("/add-bounty", async(req,res)=>{
 
-app.post("/add-bounty",(req,res)=>{
+const {orderId, missionId, amount, username} = req.body;
 
-const {missionId,amount,username}=req.body;
+if(!orderId || !missionId || !amount){
+return res.json({error:"Missing payment data"});
+}
 
-if(!missionId || !amount){
-return res.json({error:"Invalid request"});
+const token = await getPayPalToken();
+
+const capture = await fetch(
+`https://api-m.paypal.com/v2/checkout/orders/${orderId}/capture`,
+{
+method:"POST",
+headers:{
+"Content-Type":"application/json",
+Authorization:`Bearer ${token}`
+}
+}
+);
+
+const data = await capture.json();
+
+if(!data || data.status !== "COMPLETED"){
+return res.json({error:"Payment not completed"});
 }
 
 db.run(
@@ -290,6 +384,7 @@ VALUES(?,?,?)`,
 res.json({message:"Bounty increased"});
 
 });
+
 
 /* ---------------- CLAIM ---------------- */
 
@@ -319,22 +414,20 @@ res.json({message:"Claim submitted"});
 
 });
 
-/* ---------------- LIVE PLAYER COUNT ---------------- */
+/* ---------------- AUTO EXPIRE ---------------- */
 
-app.get("/live-count",(req,res)=>{
+setInterval(()=>{
 
-db.get(`
-SELECT COUNT(DISTINCT hunter) as players
-FROM claims
-`,[],(err,row)=>{
+db.run(`
+UPDATE missions
+SET status='expired'
+WHERE expires_at < datetime('now')
+AND status='active'
+`);
 
-res.json({players:row.players || 0});
+},60000);
 
-});
-
-});
-
-/* ---------------- HUNTER LEADERBOARD ---------------- */
+/* ---------------- LEADERBOARDS ---------------- */
 
 app.get("/leaderboard/hunters",(req,res)=>{
 
@@ -353,8 +446,6 @@ res.json(rows);
 
 });
 
-/* ---------------- MOST WANTED ---------------- */
-
 app.get("/leaderboard/wanted",(req,res)=>{
 
 db.all(`
@@ -371,15 +462,14 @@ res.json(rows);
 
 });
 
-/* ---------------- SERVER ---------------- */
-// Root route to show server is running
-app.get("/", (req, res) => {
-  res.send("Backend is running 🚀");
+/* ---------------- ROOT ---------------- */
+
+app.get("/",(req,res)=>{
+res.send("Backend is running 🚀");
 });
+
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT,()=>{
-
 console.log("Server running on port "+PORT);
-
 });
