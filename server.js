@@ -5,8 +5,10 @@ const jwt = require("jsonwebtoken");
 const cors = require("cors");
 const multer = require("multer");
 const path = require("path");
+const fetch = require("node-fetch");
 
 const app = express();
+
 app.use(express.json());
 app.use(cors());
 app.use("/uploads", express.static("uploads"));
@@ -71,11 +73,15 @@ app.post("/register", async (req,res)=>{
 
 const {username,password,agreedTerms,isAdult}=req.body;
 
+if(!username || !password){
+return res.status(400).json({error:"Missing fields"});
+}
+
 if(!agreedTerms || !isAdult){
 return res.status(400).json({error:"Must accept terms and confirm 18+"});
 }
 
-const hash=await bcrypt.hash(password,10);
+const hash = await bcrypt.hash(password,10);
 
 db.run(
 `INSERT INTO users(username,password,agreed_terms,is_adult,agreed_at)
@@ -86,7 +92,9 @@ function(err){
 if(err) return res.json({error:"Username already exists"});
 
 res.json({message:"Account created"});
+
 });
+
 });
 
 /* ---------------- LOGIN ---------------- */
@@ -102,30 +110,40 @@ async(err,user)=>{
 
 if(!user) return res.json({error:"Invalid login"});
 
-const match=await bcrypt.compare(password,user.password);
+const match = await bcrypt.compare(password,user.password);
 
 if(!match) return res.json({error:"Invalid login"});
 
-const token=jwt.sign({id:user.id,username:user.username},JWT_SECRET);
+const token = jwt.sign(
+{id:user.id,username:user.username},
+JWT_SECRET
+);
 
 res.json({token});
+
 });
+
 });
 
 /* ---------------- PAYPAL TOKEN ---------------- */
 
 async function getPayPalToken(){
 
-const auth = Buffer.from(PAYPAL_CLIENT + ":" + PAYPAL_SECRET).toString("base64");
+const auth = Buffer.from(
+PAYPAL_CLIENT + ":" + PAYPAL_SECRET
+).toString("base64");
 
-const res = await fetch("https://api-m.paypal.com/v1/oauth2/token",{
+const res = await fetch(
+"https://api-m.paypal.com/v1/oauth2/token",
+{
 method:"POST",
 headers:{
 Authorization:`Basic ${auth}`,
 "Content-Type":"application/x-www-form-urlencoded"
 },
 body:"grant_type=client_credentials"
-});
+}
+);
 
 const data = await res.json();
 
@@ -137,21 +155,28 @@ return data.access_token;
 
 app.post("/create-order", async(req,res)=>{
 
-const {target,reason,amount}=req.body;
+const {target,reason,amount} = req.body;
+
+if(!target || !reason || !amount){
+return res.json({error:"Missing mission data"});
+}
+
+if(Number(amount) < 7){
+return res.json({error:"Minimum bounty is $7"});
+}
 
 const total = Number(amount) + 2;
 
 const token = await getPayPalToken();
 
-const response = await fetch("https://api-m.paypal.com/v2/checkout/orders",{
-
+const response = await fetch(
+"https://api-m.paypal.com/v2/checkout/orders",
+{
 method:"POST",
-
 headers:{
 "Content-Type":"application/json",
 Authorization:`Bearer ${token}`
 },
-
 body:JSON.stringify({
 intent:"CAPTURE",
 purchase_units:[{
@@ -161,12 +186,10 @@ value:total.toFixed(2)
 }
 }]
 })
-
-});
+}
+);
 
 const order = await response.json();
-
-order.tempData = {target,reason,amount};
 
 res.json(order);
 
@@ -178,20 +201,28 @@ app.post("/capture-order", async(req,res)=>{
 
 const {orderId,target,reason,amount}=req.body;
 
+if(!orderId) return res.json({error:"Missing order ID"});
+
 const token = await getPayPalToken();
 
-await fetch(`https://api-m.paypal.com/v2/checkout/orders/${orderId}/capture`,{
-
+const capture = await fetch(
+`https://api-m.paypal.com/v2/checkout/orders/${orderId}/capture`,
+{
 method:"POST",
-
 headers:{
 "Content-Type":"application/json",
 Authorization:`Bearer ${token}`
 }
+}
+);
 
-});
+const data = await capture.json();
 
-const expires=new Date();
+if(data.status !== "COMPLETED"){
+return res.json({error:"Payment not completed"});
+}
+
+const expires = new Date();
 expires.setDate(expires.getDate()+20);
 
 db.run(
@@ -210,13 +241,15 @@ app.get("/missions",(req,res)=>{
 
 db.all(`SELECT * FROM missions WHERE status='active'`,[],(err,rows)=>{
 
-const now=new Date();
+const now = new Date();
 
-const missions=rows.map(m=>{
+const missions = rows.map(m=>{
 
-const expire=new Date(m.expires_at);
+const expire = new Date(m.expires_at);
 
-const days=Math.ceil((expire-now)/(1000*60*60*24));
+const days = Math.ceil(
+(expire-now)/(1000*60*60*24)
+);
 
 return{
 ...m,
@@ -237,6 +270,10 @@ app.post("/add-bounty",(req,res)=>{
 
 const {missionId,amount,username}=req.body;
 
+if(!missionId || !amount){
+return res.json({error:"Invalid request"});
+}
+
 db.run(
 `UPDATE missions
 SET bounty_amount=bounty_amount+?
@@ -247,7 +284,7 @@ WHERE id=?`,
 db.run(
 `INSERT INTO bounty_contributions(mission_id,contributor,amount)
 VALUES(?,?,?)`,
-[missionId,username,amount]
+[missionId,username || "anonymous",amount]
 );
 
 res.json({message:"Bounty increased"});
@@ -262,7 +299,11 @@ const missionId=req.body.missionId;
 const paypal=req.body.paypal;
 const hunter=req.body.hunter || "anonymous";
 
-const clip=req.file ? req.file.filename : null;
+if(!missionId || !paypal){
+return res.json({error:"Missing claim info"});
+}
+
+const clip = req.file ? req.file.filename : null;
 
 db.run(
 `INSERT INTO claims(mission_id,clip,paypal_email,hunter)
@@ -331,9 +372,14 @@ res.json(rows);
 });
 
 /* ---------------- SERVER ---------------- */
-
-const PORT=process.env.PORT||3000;
+// Root route to show server is running
+app.get("/", (req, res) => {
+  res.send("Backend is running 🚀");
+});
+const PORT = process.env.PORT || 3000;
 
 app.listen(PORT,()=>{
+
 console.log("Server running on port "+PORT);
+
 });
