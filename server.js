@@ -10,6 +10,7 @@ const app = express();
 
 app.use(express.json());
 app.use(cors());
+
 const limiter = rateLimit({
 windowMs: 15 * 60 * 1000,
 max: 100,
@@ -19,16 +20,33 @@ message: {error:"Too many requests, please slow down"}
 app.use(limiter);
 app.use("/uploads", express.static("uploads"));
 
+/* FILE UPLOAD SECURITY */
 const upload = multer({
 dest:"uploads/",
-limits:{fileSize:50 * 1024 * 1024}
+limits:{fileSize:50 * 1024 * 1024},
+fileFilter:(req,file,cb)=>{
+
+const allowed = [
+"video/mp4",
+"video/quicktime",
+"image/png",
+"image/jpeg"
+]
+
+if(!allowed.includes(file.mimetype)){
+return cb(new Error("Invalid file type"))
+}
+
+cb(null,true)
+
+}
 });
 
 const db = new sqlite3.Database("./database.db");
 
 const JWT_SECRET = process.env.JWT_SECRET || "secret";
 
-/* MAKE SURE THESE MATCH YOUR PAYPAL ACCOUNT */
+/* PAYPAL */
 const PAYPAL_CLIENT = process.env.PAYPAL_CLIENT_ID;
 const PAYPAL_SECRET = process.env.PAYPAL_SECRET;
 
@@ -129,7 +147,8 @@ if(!match) return res.json({error:"Invalid login"});
 
 const token = jwt.sign(
 {id:user.id,username:user.username},
-JWT_SECRET
+JWT_SECRET,
+{expiresIn:"7d"}
 );
 
 res.json({
@@ -200,6 +219,21 @@ count++;
 res.json({players:count});
 
 });
+
+/* CLEAN INACTIVE USERS */
+setInterval(()=>{
+
+const now = Date.now()
+
+for(let user in activeUsers){
+
+if(now - activeUsers[user] > 60000){
+delete activeUsers[user]
+}
+
+}
+
+},30000)
 
 /* ---------------- PAYPAL TOKEN ---------------- */
 
@@ -323,9 +357,11 @@ const missions = rows.map(m=>{
 
 const expire = new Date(m.expires_at);
 
-const days = Math.ceil(
+let days = Math.ceil(
 (expire-now)/(1000*60*60*24)
 );
+
+if(days < 0) days = 0;
 
 return{
 ...m,
@@ -341,6 +377,7 @@ res.json(missions);
 });
 
 /* ---------------- ADD BOUNTY ---------------- */
+
 app.post("/add-bounty", async(req,res)=>{
 
 const {orderId, missionId, amount, username} = req.body;
@@ -384,7 +421,6 @@ VALUES(?,?,?)`,
 res.json({message:"Bounty increased"});
 
 });
-
 
 /* ---------------- CLAIM ---------------- */
 
@@ -440,7 +476,7 @@ ORDER BY wins DESC
 LIMIT 5
 `,[],(err,rows)=>{
 
-res.json(rows);
+res.json(rows || []);
 
 });
 
@@ -456,7 +492,7 @@ ORDER BY hunts DESC
 LIMIT 3
 `,[],(err,rows)=>{
 
-res.json(rows);
+res.json(rows || []);
 
 });
 
