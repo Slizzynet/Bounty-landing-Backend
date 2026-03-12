@@ -30,7 +30,9 @@ const allowed = [
 "video/mp4",
 "video/quicktime",
 "image/png",
-"image/jpeg"
+"image/jpeg",
+"image/gif",
+"video/webm"
 ]
 
 if(!allowed.includes(file.mimetype)){
@@ -52,6 +54,22 @@ const PAYPAL_SECRET = process.env.PAYPAL_SECRET;
 
 let activeUsers = {};
 
+/* AUTHENTICATION MIDDLEWARE */
+function authenticateToken(req, res, next) {
+  const authHeader = req.headers["authorization"];
+  const token = authHeader && authHeader.split(" ")[1];
+
+  if (!token) {
+    return res.status(401).json({ error: "No token provided" });
+  }
+
+  jwt.verify(token, JWT_SECRET, (err, user) => {
+    if (err) return res.status(403).json({ error: "Invalid token" });
+    req.user = user;
+    next();
+  });
+}
+
 /* ---------------- DATABASE ---------------- */
 
 db.serialize(()=>{
@@ -71,8 +89,9 @@ db.run(`
 CREATE TABLE IF NOT EXISTS missions(
 id INTEGER PRIMARY KEY AUTOINCREMENT,
 target TEXT,
-reason TEXT,
+mode TEXT,
 bounty_amount REAL,
+posted_by TEXT,
 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 expires_at DATETIME,
 status TEXT DEFAULT 'active'
@@ -82,9 +101,8 @@ db.run(`
 CREATE TABLE IF NOT EXISTS claims(
 id INTEGER PRIMARY KEY AUTOINCREMENT,
 mission_id INTEGER,
-hunter TEXT,
 clip TEXT,
-paypal_email TEXT,
+hunter TEXT,
 status TEXT DEFAULT 'pending'
 )`);
 
@@ -112,6 +130,7 @@ if(!agreedTerms || !isAdult){
 return res.status(400).json({error:"Must accept terms and confirm 18+"});
 }
 
+try{
 const hash = await bcrypt.hash(password,10);
 
 db.run(
@@ -125,6 +144,10 @@ if(err) return res.json({error:"Username or email already exists"});
 res.json({message:"Account created"});
 
 });
+}catch(e){
+console.error("Register error:",e);
+res.status(500).json({error:"Registration failed"});
+}
 
 });
 
@@ -134,13 +157,23 @@ app.post("/login",(req,res)=>{
 
 const {email,password}=req.body;
 
+if(!email || !password){
+return res.json({error:"Email and password required"});
+}
+
 db.get(
-`SELECT * FROM users WHERE email=? OR username=?`,
-[email,email],
+`SELECT * FROM users WHERE email=?`,
+[email],
 async(err,user)=>{
+
+if(err){
+console.error("Login query error:",err);
+return res.status(500).json({error:"Database error"});
+}
 
 if(!user) return res.json({error:"Invalid login"});
 
+try{
 const match = await bcrypt.compare(password,user.password);
 
 if(!match) return res.json({error:"Invalid login"});
@@ -155,6 +188,10 @@ res.json({
 token,
 username:user.username
 });
+}catch(e){
+console.error("Password comparison error:",e);
+res.status(500).json({error:"Login failed"});
+}
 
 });
 
@@ -183,6 +220,10 @@ message:"If the account exists a reset email was sent"
 app.get("/user-count",(req,res)=>{
 
 db.get(`SELECT COUNT(*) as total FROM users`,[],(err,row)=>{
+if(err){
+console.error("User count error:",err);
+return res.status(500).json({error:"Database error"});
+}
 res.json({total:row.total || 0});
 });
 
@@ -202,9 +243,9 @@ res.json({ok:true});
 
 });
 
-/* ---------------- LIVE COUNT ---------------- */
+/* ---------------- ACTIVE PLAYERS COUNT ---------------- */
 
-app.get("/live-count",(req,res)=>{
+app.get("/active-players", authenticateToken, (req,res)=>{
 
 const now = Date.now();
 
@@ -216,7 +257,7 @@ count++;
 }
 }
 
-res.json({players:count});
+res.json({count});
 
 });
 
@@ -239,6 +280,7 @@ delete activeUsers[user]
 
 async function getPayPalToken(){
 
+try{
 const auth = Buffer.from(
 PAYPAL_CLIENT + ":" + PAYPAL_SECRET
 ).toString("base64");
@@ -258,16 +300,21 @@ body:"grant_type=client_credentials"
 const data = await res.json();
 
 return data.access_token;
+}catch(e){
+console.error("PayPal token error:",e);
+throw e;
+}
 
 }
 
 /* ---------------- CREATE ORDER ---------------- */
 
-app.post("/create-order", async(req,res)=>{
+app.post("/create-order", authenticateToken, async(req,res)=>{
 
-const {target,reason,amount} = req.body;
+try{
+const {target,mode,amount} = req.body;
 
-if(!target || !reason || !amount){
+if(!target || !mode || !amount){
 return res.json({error:"Missing mission data"});
 }
 
@@ -302,14 +349,19 @@ value:total.toFixed(2)
 const order = await response.json();
 
 res.json(order);
+}catch(e){
+console.error("Create order error:",e);
+res.status(500).json({error:"Failed to create order"});
+}
 
 });
 
 /* ---------------- CAPTURE ORDER ---------------- */
 
-app.post("/capture-order", async(req,res)=>{
+app.post("/capture-order", authenticateToken, async(req,res)=>{
 
-const {orderId,target,reason,amount}=req.body;
+try{
+const {orderId,target,mode,amount}=req.body;
 
 if(!orderId) return res.json({error:"Missing order ID"});
 
@@ -336,36 +388,54 @@ const expires = new Date();
 expires.setDate(expires.getDate()+20);
 
 db.run(
-`INSERT INTO missions(target,reason,bounty_amount,expires_at)
-VALUES(?,?,?,?)`,
-[target,reason,amount,expires.toISOString()]
+`INSERT INTO missions(target,mode,bounty_amount,posted_by,expires_at)
+VALUES(?,?,?,?,?)`,
+[target,mode,amount,req.user.username,expires.toISOString()],
+function(err){
+if(err){
+console.error("Mission insert error:",err);
+return res.status(500).json({error:"Failed to create mission"});
+}
+res.json({message:"Mission created",id:this.lastID});
+}
 );
-
-res.json({message:"Mission created"});
+}catch(e){
+console.error("Capture order error:",e);
+res.status(500).json({error:"Payment processing failed"});
+}
 
 });
 
-/* ---------------- MISSIONS ---------------- */
+/* ---------------- GET MISSIONS ---------------- */
 
-app.get("/missions",(req,res)=>{
+app.get("/missions", authenticateToken, (req,res)=>{
 
 db.all(`SELECT * FROM missions WHERE status='active'`,[],(err,rows)=>{
 
+if(err){
+console.error("Missions query error:",err);
+return res.status(500).json({error:"Database error"});
+}
+
 const now = new Date();
 
-const missions = rows.map(m=>{
+const missions = (rows || []).map(m=>{
 
 const expire = new Date(m.expires_at);
 
-let days = Math.ceil(
-(expire-now)/(1000*60*60*24)
+const days = Math.max(
+Math.ceil((expire-now)/(1000*60*60*24)),
+0
 );
 
-if(days < 0) days = 0;
-
 return{
-...m,
-days_remaining:days
+id:m.id,
+target:m.target,
+mode:m.mode,
+bounty:m.bounty_amount,
+postedBy:m.posted_by,
+expiresAt:m.expires_at,
+daysRemaining:days
 };
 
 });
@@ -376,81 +446,111 @@ res.json(missions);
 
 });
 
-/* ---------------- ADD BOUNTY ---------------- */
+/* ---------------- POST MISSION ---------------- */
 
-app.post("/add-bounty", async(req,res)=>{
+app.post("/missions", authenticateToken, (req,res)=>{
 
-const {orderId, missionId, amount, username} = req.body;
+try{
+const {target,mode,bounty} = req.body;
 
-if(!orderId || !missionId || !amount){
-return res.json({error:"Missing payment data"});
+if(!target || !mode || !bounty){
+return res.status(400).json({error:"Missing mission data"});
 }
 
-const token = await getPayPalToken();
-
-const capture = await fetch(
-`https://api-m.paypal.com/v2/checkout/orders/${orderId}/capture`,
-{
-method:"POST",
-headers:{
-"Content-Type":"application/json",
-Authorization:`Bearer ${token}`
+const amount = parseFloat(bounty);
+if(amount < 7){
+return res.status(400).json({error:"Minimum bounty is $7"});
 }
-}
-);
 
-const data = await capture.json();
-
-if(!data || data.status !== "COMPLETED"){
-return res.json({error:"Payment not completed"});
-}
+const expires = new Date();
+expires.setDate(expires.getDate()+20);
 
 db.run(
-`UPDATE missions
-SET bounty_amount=bounty_amount+?
-WHERE id=?`,
-[amount,missionId]
-);
-
-db.run(
-`INSERT INTO bounty_contributions(mission_id,contributor,amount)
-VALUES(?,?,?)`,
-[missionId,username || "anonymous",amount]
-);
-
-res.json({message:"Bounty increased"});
-
-});
-
-/* ---------------- CLAIM ---------------- */
-
-app.post("/claims", upload.single("file"), (req,res)=>{
-
-const missionId=req.body.missionId;
-const paypal=req.body.paypal;
-const hunter=req.body.hunter || "anonymous";
-
-if(!missionId || !paypal){
-return res.json({error:"Missing claim info"});
-}
-
-const clip = req.file ? req.file.filename : null;
-
-db.run(
-`INSERT INTO claims(mission_id,clip,paypal_email,hunter)
-VALUES(?,?,?,?)`,
-[missionId,clip,paypal,hunter],
+`INSERT INTO missions(target,mode,bounty_amount,posted_by,expires_at)
+VALUES(?,?,?,?,?)`,
+[target,mode,amount,req.user.username,expires.toISOString()],
 function(err){
+if(err){
+console.error("Mission insert error:",err);
+return res.status(500).json({error:"Failed to create mission"});
+}
+res.json({message:"Mission posted",id:this.lastID});
+}
+);
+}catch(e){
+console.error("Post mission error:",e);
+res.status(500).json({error:"Failed to post mission"});
+}
 
-if(err) return res.json({error:"Claim failed"});
+});
 
+/* ---------------- SUBMIT PROOF / CLAIM MISSION ---------------- */
+
+app.post("/missions/:missionId/claim", authenticateToken, upload.single("proof"), (req,res)=>{
+
+try{
+const {missionId} = req.params;
+const proof = req.file ? req.file.filename : null;
+
+if(!missionId || !proof){
+return res.status(400).json({error:"Missing claim info"});
+}
+
+db.run(
+`INSERT INTO claims(mission_id,clip,hunter)
+VALUES(?,?,?)`,
+[missionId,proof,req.user.username],
+function(err){
+if(err){
+console.error("Claim insert error:",err);
+return res.status(500).json({error:"Claim failed"});
+}
 res.json({message:"Claim submitted"});
+}
+);
+}catch(e){
+console.error("Claim submission error:",e);
+res.status(500).json({error:"Failed to submit claim"});
+}
 
 });
 
+/* ---------------- ADD BOUNTY TO MISSION ---------------- */
+
+app.post("/missions/:missionId/add-bounty", authenticateToken, (req,res)=>{
+
+try{
+const {missionId} = req.params;
+const {amount} = req.body;
+
+if(!missionId || !amount){
+return res.status(400).json({error:"Missing bounty data"});
+}
+
+const addAmount = parseFloat(amount);
+if(addAmount < 1){
+return res.status(400).json({error:"Minimum bounty is $1"});
+}
+
+db.run(
+`UPDATE missions SET bounty_amount = bounty_amount + ? WHERE id = ?`,
+[addAmount,missionId],
+function(err){
+if(err){
+console.error("Update bounty error:",err);
+return res.status(500).json({error:"Failed to add bounty"});
+}
+res.json({message:"Bounty increased"});
+}
+);
+}catch(e){
+console.error("Add bounty error:",e);
+res.status(500).json({error:"Failed to add bounty"});
+}
+
 });
 
-/* ---------------- AUTO EXPIRE ---------------- */
+/* ---------------- AUTO EXPIRE MISSIONS ---------------- */
 
 setInterval(()=>{
 
@@ -459,11 +559,53 @@ UPDATE missions
 SET status='expired'
 WHERE expires_at < datetime('now')
 AND status='active'
-`);
+`,(err)=>{
+if(err) console.error("Auto expire error:",err);
+});
 
 },60000);
 
-/* ---------------- LEADERBOARDS ---------------- */
+/* ---------------- LEADERBOARDS (COMBINED) ---------------- */
+
+app.get("/leaderboards", authenticateToken, (req,res)=>{
+
+try{
+db.all(
+`SELECT hunter, COUNT(*) as score FROM claims 
+WHERE status='approved' GROUP BY hunter ORDER BY score DESC LIMIT 5`,
+[],
+(err,hunters)=>{
+if(err){
+console.error("Top hunters query error:",err);
+return res.status(500).json({error:"Database error"});
+}
+
+db.all(
+`SELECT target, COUNT(*) as bounty FROM missions 
+GROUP BY target ORDER BY bounty DESC LIMIT 5`,
+[],
+(err2,wanted)=>{
+if(err2){
+console.error("Most wanted query error:",err2);
+return res.status(500).json({error:"Database error"});
+}
+
+res.json({
+topHunters:hunters||[],
+mostWanted:wanted||[]
+});
+}
+);
+}
+);
+}catch(e){
+console.error("Leaderboards error:",e);
+res.status(500).json({error:"Failed to load leaderboards"});
+}
+
+});
+
+/* LEGACY ENDPOINTS (for backwards compatibility) */
 
 app.get("/leaderboard/hunters",(req,res)=>{
 
@@ -475,9 +617,11 @@ GROUP BY hunter
 ORDER BY wins DESC
 LIMIT 5
 `,[],(err,rows)=>{
-
+if(err){
+console.error("Hunters query error:",err);
+return res.status(500).json({error:"Database error"});
+}
 res.json(rows || []);
-
 });
 
 });
@@ -491,17 +635,26 @@ GROUP BY target
 ORDER BY hunts DESC
 LIMIT 3
 `,[],(err,rows)=>{
-
+if(err){
+console.error("Wanted query error:",err);
+return res.status(500).json({error:"Database error"});
+}
 res.json(rows || []);
-
 });
 
 });
 
-/* ---------------- ROOT ---------------- */
+/* ---------------- ROOT ENDPOINT ---------------- */
 
 app.get("/",(req,res)=>{
-res.send("Backend is running 🚀");
+res.send("MISSION BOARD Backend is running 🚀");
+});
+
+/* ERROR HANDLER */
+
+app.use((err,req,res,next)=>{
+console.error("Global error:",err);
+res.status(500).json({error:"Internal server error"});
 });
 
 const PORT = process.env.PORT || 3000;
